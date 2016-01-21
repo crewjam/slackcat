@@ -1,8 +1,16 @@
-// package slackio provides a reader and writer interface to Slack.
+// Package slackio provides a reader and writer interface to Slack.
+//
+// Writing to a Writer emits messages to the configured Slack channel.
+// Reading from a Reader receives messages, separated by a newline from
+// a slack channel.
+//
+// Of course, these simple interfaces hide quite a bit of the richness
+// of the slack interface, but they are useful none the less for simple
+// bots, chatops, and whatnot.
 //
 // Example:
 //
-//    slack := New("", slackToken, "general")
+//    slack := NewReaderWriter("", slackToken, "general")
 //    defer slack.Close()
 //    fmt.Fprintf(slack, "Hello, World!")
 //    line, _, _ := bufio.NewReader(slack).ReadLine()
@@ -16,69 +24,183 @@ import (
 	"io"
 
 	"github.com/bobbytables/slacker"
+	"github.com/crewjam/errset"
 )
 
-// Slack is implements the io.ReadCloser and io.WriteCloser interfaces
+// Reader reads messages from the specified slack channel. Create
+// new instances with NewReader()
+type Reader struct {
+	common     *readerWriterCommon
+	pipeReader *io.PipeReader
+	pipeWriter *io.PipeWriter
+}
+
+// NewReader returns a new io.Reader that receives messages as they
+// are posted to a the specified slack channel. URL is the endpoint
+// of the slack server, which can be empty to use the default. token
+// is your slack token and channel is the name of the channel to
+// receive from.
+func NewReader(url, token, channel string) (*Reader, error) {
+	common, err := newIface(url, token, channel)
+	if err != nil {
+		return nil, err
+	}
+	s := &Reader{
+		common: common,
+	}
+	s.init()
+	return s, nil
+}
+
+func (s *Reader) init() {
+	s.pipeReader, s.pipeWriter = io.Pipe()
+	go s.reader()
+}
+
+func (s *Reader) Read(p []byte) (n int, err error) {
+	return s.pipeReader.Read(p)
+}
+
+func (s *Reader) reader() {
+	for {
+		event := <-s.common.broker.Events()
+		if event.Type == "message" {
+			msg, err := event.Message()
+			if err != nil {
+				s.pipeWriter.CloseWithError(err)
+			}
+			if msg.Channel != s.common.channelID {
+				continue
+			}
+			if msg.User == s.common.selfUserID {
+				continue
+			}
+			_, err = fmt.Fprintf(s.pipeWriter, "%s\n", msg.Text)
+			if err != nil {
+				s.pipeWriter.CloseWithError(err)
+				return
+			}
+		}
+	}
+}
+
+// Close disconnects from the slack server.
+func (s *Reader) Close() error {
+	s.pipeReader.Close()
+	s.pipeWriter.Close()
+	return s.common.Close()
+}
+
+// Writer sends messages to the specified slack channel. Create
+// new instances with NewWriter()
+type Writer struct {
+	common *readerWriterCommon
+}
+
+// NewWriter returns a new io.WriteCloser that sends message to the
+// the specified slack channel. URL is the endpoint of the slack server,
+// which can be empty to use the default. token is your slack token and
+// channel is the name of the channel to receive from.
+func NewWriter(url, token, channel string) (*Writer, error) {
+	common, err := newIface(url, token, channel)
+	if err != nil {
+		return nil, err
+	}
+	s := &Writer{
+		common: common,
+	}
+	return s, nil
+}
+
+func (s *Writer) Write(p []byte) (n int, err error) {
+	err = s.common.broker.Publish(slacker.RTMMessage{
+		Type:    "message",
+		Text:    string(p),
+		Channel: s.common.channelID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(p), err
+}
+
+// Close disconnects from the slack server
+func (s *Writer) Close() error {
+	return s.common.Close()
+}
+
+// ReaderWriter is implements the io.ReadCloser and io.WriteCloser interfaces
 // for slack channel. Writing to this object posts messages to the specified
 // slack channel. Reading from this object receives messages from the
-// specified slack channel.
-type Slack struct {
-	URL     string // the URL of the slack endpoint (empty string for the default)
-	Token   string // the slack token
-	Channel string // the name of the channel to write in / read from.
+// specified slack channel. Create new instances with NewReaderWriter()
+type ReaderWriter struct {
+	common *readerWriterCommon
+	Reader
+	Writer
+}
 
+// NewReaderWriter returns a new io.WriteCloser and io.ReadCloser that sends message
+// to and receives messages from the specified slack channel. URL is the
+// endpoint of the slack server, which can be empty to use the default. token is
+// your slack token and channel is the name of the channel to receive from.
+func NewReaderWriter(url, token, channel string) (*ReaderWriter, error) {
+	common, err := newIface(url, token, channel)
+	if err != nil {
+		return nil, err
+	}
+	s := &ReaderWriter{
+		common: common,
+		Reader: Reader{
+			common: common,
+		},
+		Writer: Writer{
+			common: common,
+		},
+	}
+	s.Reader.init()
+	return s, nil
+}
+
+// Close disconnects from the slack server
+func (s *ReaderWriter) Close() error {
+	errs := errset.ErrSet{}
+	errs = append(errs, s.Reader.Close())
+	errs = append(errs, s.common.Close())
+	return errs.ReturnValue()
+}
+
+type readerWriterCommon struct {
 	channelID  string
 	selfUserID string
 	client     *slacker.APIClient
 	broker     *slacker.RTMBroker
-
-	readPipeReader  *io.PipeReader
-	readPipeWriter  *io.PipeWriter
-	writePipeReader *io.PipeReader
-	writePipeWriter *io.PipeWriter
 }
 
-// New returns a new Slack
-func New(url, token, channel string) (*Slack, error) {
-	s := Slack{
-		URL:     url,
-		Token:   token,
-		Channel: channel,
-	}
-	if err := s.init(); err != nil {
-		return nil, err
-	}
-	return &s, nil
-}
-
-func (s *Slack) init() error {
-	if s.broker != nil {
-		return nil
-	}
-
-	s.client = slacker.NewAPIClient(s.Token, s.URL)
+func newIface(url, token, channelName string) (*readerWriterCommon, error) {
+	s := &readerWriterCommon{}
+	s.client = slacker.NewAPIClient(token, url)
 
 	// fetch the channel ID
 	s.channelID = ""
 	channels, err := s.client.ChannelsList()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, channel := range channels {
-		if channel.Name == s.Channel {
+		if channel.Name == channelName {
 			s.channelID = channel.ID
 			break
 		}
 	}
 	if s.channelID == "" {
-		return fmt.Errorf("cannot find channel %s", s.Channel)
+		return nil, fmt.Errorf("cannot find channel %s", channelName)
 	}
 
 	// figure out what user we are connected as so we can ignore
 	// previous messages from that user.
 	authBuf, err := s.client.RunMethod("auth.test")
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	var auth struct {
 		UserID string `json:"user_id"`
@@ -87,95 +209,23 @@ func (s *Slack) init() error {
 
 	rtmStart, err := s.client.RTMStart()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.selfUserID = auth.UserID
 
 	s.broker = slacker.NewRTMBroker(rtmStart)
 	err = s.broker.Connect()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return s, nil
 }
 
-func (s *Slack) initWrite() error {
-	if err := s.init(); err != nil {
-		return err
-	}
-	return nil
+// Close disconnects from the slack server
+func (s *readerWriterCommon) Close() error {
+	return s.broker.Close()
 }
 
-func (s *Slack) initRead() error {
-	if err := s.init(); err != nil {
-		return err
-	}
-	if s.readPipeWriter == nil {
-		s.readPipeReader, s.readPipeWriter = io.Pipe()
-		go s.reader()
-	}
-	return nil
-}
-
-func (s *Slack) Write(p []byte) (n int, err error) {
-	if err := s.initWrite(); err != nil {
-		return 0, err
-	}
-	err = s.broker.Publish(slacker.RTMMessage{
-		Type:    "message",
-		Text:    string(p),
-		Channel: s.channelID,
-	})
-	if err != nil {
-		return 0, err
-	}
-	return len(p), err
-}
-
-func (s *Slack) Read(p []byte) (n int, err error) {
-	if err := s.initRead(); err != nil {
-		return 0, err
-	}
-	n, err = s.readPipeReader.Read(p)
-	return n, err
-}
-
-func (s *Slack) reader() {
-	for {
-		event := <-s.broker.Events()
-		if event.Type == "message" {
-			msg, err := event.Message()
-			if err != nil {
-				s.readPipeWriter.CloseWithError(err)
-			}
-			if msg.Channel != s.channelID {
-				continue
-			}
-			if msg.User == s.selfUserID {
-				continue
-			}
-			_, err = fmt.Fprintf(s.readPipeWriter, "%s\n", msg.Text)
-			if err != nil {
-				s.readPipeWriter.CloseWithError(err)
-				return
-			}
-		}
-	}
-}
-
-func (s *Slack) Close() error {
-	if s.readPipeReader != nil {
-		s.readPipeReader.Close()
-	}
-	if s.readPipeWriter != nil {
-		s.readPipeWriter.Close()
-	}
-	if s.broker != nil {
-		s.broker.Close()
-	}
-	return nil
-}
-
-var _ io.ReadCloser = &Slack{}
-var _ io.WriteCloser = &Slack{}
+var _ io.ReadCloser = &Reader{}
+var _ io.WriteCloser = &Writer{}

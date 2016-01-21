@@ -27,7 +27,7 @@ func main() {
 		*doRead = false
 	}
 
-	s, err := slackio.New(*SlackURL, *SlackToken, *Channel)
+	s, err := slackio.NewReaderWriter(*endpoint, *token, *channel)
 	if err != nil {
 		panic(err)
 	}
