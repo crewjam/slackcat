@@ -19,6 +19,10 @@ Run a command and share the output with your team:
 
     make deploy ENV=production 2>&1 | slackcat -tee -token=$SLACK_TOKEN -channel=chatops
 
+Annoy your friends:
+
+    slackcat -read -token=$SLACK_TOKEN -channel random | (while read x; do say --voice=Samantha "$x"; done)
+
 ## slackio
 
 package slackio provides a reader and writer interface to Slack.
